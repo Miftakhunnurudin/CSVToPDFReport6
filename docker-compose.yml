@@ -9,6 +9,10 @@ services:
       - "5000:5000"
     environment:
       - NODE_ENV=production
+      # Set to "false" if running Docker with HTTP (not HTTPS)
+      # This allows login to work when accessing via http://localhost:5000
+      # For production HTTPS deployments, keep this unset (defaults to true)
+      - USE_SECURE_COOKIES=false
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]

@@ -51,6 +51,14 @@ passport.deserializeUser((id: string, done) => {
   }
 });
 
+const isProduction = process.env.NODE_ENV === "production";
+const useSecureCookies = process.env.USE_SECURE_COOKIES === "false" ? false : isProduction;
+
+if (isProduction && !useSecureCookies) {
+  log("⚠️  WARNING: Running in production with secure cookies DISABLED. Session cookies will be sent over HTTP.");
+  log("   This is only safe if you're behind a reverse proxy that handles HTTPS termination.");
+}
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET || "interview-evaluation-secret-key-change-in-production",
@@ -62,7 +70,7 @@ app.use(
     cookie: {
       maxAge: 24 * 60 * 60 * 1000,
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: useSecureCookies,
       sameSite: "lax",
     },
   })
