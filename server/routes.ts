@@ -1,0 +1,272 @@
+import type { Express, Request, Response, NextFunction } from "express";
+import { createServer, type Server } from "http";
+import { storage } from "./storage";
+import multer from "multer";
+import { parseCSVContent } from "./csvParser";
+import { generateCandidatesPDF } from "./pdfGenerator";
+import { randomUUID } from "crypto";
+import { candidateEvaluationSchema } from "@shared/schema";
+import { z } from "zod";
+import passport from "passport";
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'));
+    }
+  },
+});
+
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  if (req.isAuthenticated()) {
+    return next();
+  }
+  res.status(401).json({ error: "Unauthorized - Please login" });
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  app.post("/api/auth/login", (req, res, next) => {
+    passport.authenticate("local", (err: any, user: Express.User | false, info: any) => {
+      if (err) {
+        return res.status(500).json({ error: "Authentication error" });
+      }
+      if (!user) {
+        return res.status(401).json({ error: info?.message || "Invalid credentials" });
+      }
+      req.login(user, (err) => {
+        if (err) {
+          return res.status(500).json({ error: "Login failed" });
+        }
+        return res.json({ user: { id: user.id, username: user.username } });
+      });
+    })(req, res, next);
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    req.logout((err) => {
+      if (err) {
+        return res.status(500).json({ error: "Logout failed" });
+      }
+      res.json({ message: "Logged out successfully" });
+    });
+  });
+
+  app.get("/api/auth/session", (req, res) => {
+    if (req.isAuthenticated() && req.user) {
+      return res.json({ 
+        authenticated: true, 
+        user: { id: req.user.id, username: req.user.username } 
+      });
+    }
+    res.json({ authenticated: false });
+  });
+
+  // Upload CSV file and parse it - Returns PDF
+  app.post("/api/upload-csv", requireAuth, upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      const content = req.file.buffer.toString('utf-8');
+      const result = parseCSVContent(content);
+
+      if (result.data.length === 0 && result.errors.length > 0) {
+        return res.status(400).json({ 
+          error: "CSV parsing failed - no valid data rows found",
+          errors: result.errors,
+          candidateCount: 0,
+        });
+      }
+
+      if (result.data.length === 0) {
+        return res.status(400).json({ 
+          error: "No valid data found in CSV file",
+          errors: ["CSV file appears to be empty or has no valid rows"]
+        });
+      }
+
+      const sessionId = randomUUID();
+      await storage.saveCandidates(sessionId, result.data);
+
+      // Generate PDF from the parsed candidates
+      const pdfBuffer = generateCandidatesPDF(result.data);
+      
+      // Set headers for PDF download
+      const fileName = `candidates_evaluation_${new Date().toISOString().split('T')[0]}_${sessionId.substring(0, 8)}.pdf`;
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Length', pdfBuffer.length);
+      
+      // Send PDF buffer as response
+      res.send(pdfBuffer);
+    } catch (error) {
+      console.error("CSV upload error:", error);
+      res.status(500).json({ 
+        error: "Failed to process CSV file",
+        details: error instanceof Error ? error.message : "Unknown error"
+      });
+    }
+  });
+
+  // Generate PDF from JSON data
+  app.post("/api/generate-pdf-json", requireAuth, async (req, res) => {
+    try {
+      const requestSchema = z.object({
+        candidates: z.array(z.any())
+      });
+
+      const parsed = requestSchema.safeParse(req.body);
+      
+      if (!parsed.success) {
+        return res.status(400).json({ 
+          error: "Invalid JSON data",
+          details: parsed.error.errors
+        });
+      }
+
+      let { candidates } = parsed.data;
+
+      if (candidates.length === 0) {
+        return res.status(400).json({ 
+          error: "No candidate data provided"
+        });
+      }
+
+      // Transform candidates to match expected schema format
+      candidates = candidates.map((candidate: any) => {
+        // Helper function to parse JSON strings to arrays
+        const parseJsonArray = (value: any): string[] => {
+          if (Array.isArray(value)) return value;
+          if (typeof value === 'string') {
+            try {
+              const parsed = JSON.parse(value);
+              return Array.isArray(parsed) ? parsed : [];
+            } catch {
+              return [];
+            }
+          }
+          return [];
+        };
+
+        // Transform PascalCase to camelCase and convert types
+        return {
+          guid: candidate.GUID || candidate.guid,
+          result: candidate.Result || candidate.result,
+          dateTime: candidate.DateTime || candidate.dateTime,
+          phoneNumber: String(candidate.PhoneNumber || candidate.phoneNumber || ''),
+          contactName: candidate.ContactName || candidate.contactName,
+          previousLocation: candidate.PreviousLocation || candidate.previousLocation,
+          employmentPeriod: candidate.EmploymentPeriod !== undefined && candidate.EmploymentPeriod !== null && candidate.EmploymentPeriod !== '' 
+            ? String(candidate.EmploymentPeriod) 
+            : (candidate.employmentPeriod || ''),
+          workPerWeek: candidate.WorkPerWeek || candidate.workPerWeek,
+          canTravel: candidate.CanTravel || candidate.canTravel,
+          oneYearExperience: candidate.OneYearExperience || candidate.oneYearExperience,
+          validDriverLicense: candidate.ValidDriverLicense || candidate.validDriverLicense,
+          reliableTransport: candidate.ReliableTransport || candidate.reliableTransport,
+          payRate: candidate.PayRate || candidate.payRate,
+          dementiaClient: candidate.DementiaClient || candidate.dementiaClient,
+          backgroundCheck: candidate.BackgroundCheck || candidate.backgroundCheck,
+          tbTestNegative: candidate.TBTestNegative || candidate.tbTestNegative,
+          cprCertificate: candidate.CPRCertificate || candidate.cprCertificate,
+          experience: candidate.Experience || candidate.experience,
+          clientType: candidate.ClientType || candidate.clientType,
+          caregiverQuality: candidate.CaregiverQuality || candidate.caregiverQuality,
+          clientRefusal: candidate.ClientRefusal || candidate.clientRefusal,
+          firstAction: candidate.FirstAction || candidate.firstAction,
+          phone2: candidate.Phone2 || candidate.phone2,
+          emailAddress: candidate.EmailAddress || candidate.emailAddress,
+          experienceScore: String(candidate.ExperienceScore || candidate.experienceScore || ''),
+          compassionScore: String(candidate.CompassionScore || candidate.compassionScore || ''),
+          safetyScore: String(candidate.SafetyScore || candidate.safetyScore || ''),
+          professionalismScore: String(candidate.ProfessionalismScore || candidate.professionalismScore || ''),
+          performanceSummary: candidate.PerformanceSummary || candidate.performanceSummary,
+          redFlags: parseJsonArray(candidate.RedFlags || candidate.redFlags),
+          followUpQuestions: parseJsonArray(candidate.FollowUpQuestions || candidate.followUpQuestions),
+          questionsAsked: parseJsonArray(candidate.QuestionsAsked || candidate.questionsAsked),
+          callbackDate: candidate.CallbackDate || candidate.callbackDate,
+        };
+      });
+
+      // Validate transformed candidates
+      const validationSchema = z.object({
+        candidates: z.array(candidateEvaluationSchema)
+      });
+
+      const validatedData = validationSchema.safeParse({ candidates });
+
+      if (!validatedData.success) {
+        return res.status(400).json({ 
+          error: "Invalid candidate data after transformation",
+          details: validatedData.error.errors
+        });
+      }
+
+      const sessionId = randomUUID();
+      await storage.saveCandidates(sessionId, validatedData.data.candidates);
+
+      // Generate PDF from the candidates
+      const pdfBuffer = generateCandidatesPDF(validatedData.data.candidates);
+      
+      // Set headers for PDF download
+      const fileName = `candidates_evaluation_${new Date().toISOString().split('T')[0]}_${sessionId.substring(0, 8)}.pdf`;
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+      res.setHeader('Content-Length', pdfBuffer.length);
+      
+      // Send PDF buffer as response
+      res.send(pdfBuffer);
+    } catch (error) {
+      console.error("JSON PDF generation error:", error);
+      res.status(500).json({ 
+        error: "Failed to generate PDF from JSON",
+        details: error instanceof Error ? error.message : "Unknown error"
+      });
+    }
+  });
+
+  // Get candidates by session ID
+  app.get("/api/candidates/:sessionId", requireAuth, async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      const candidates = await storage.getCandidates(sessionId);
+
+      if (candidates.length === 0) {
+        return res.status(404).json({ error: "No candidates found for this session" });
+      }
+
+      res.json({ candidates });
+    } catch (error) {
+      console.error("Get candidates error:", error);
+      res.status(500).json({ error: "Failed to retrieve candidates" });
+    }
+  });
+
+  // Clear candidates by session ID
+  app.delete("/api/candidates/:sessionId", requireAuth, async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      await storage.clearCandidates(sessionId);
+      res.json({ message: "Candidates cleared successfully" });
+    } catch (error) {
+      console.error("Clear candidates error:", error);
+      res.status(500).json({ error: "Failed to clear candidates" });
+    }
+  });
+
+  // Health check endpoint
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", message: "Interview Evaluation API is running" });
+  });
+
+  const httpServer = createServer(app);
+
+  return httpServer;
+}
